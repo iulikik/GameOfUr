@@ -24,6 +24,7 @@
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <Preferences.h>
 #include "brightness.h"
 
 // ---------------------------------------------------------------------------
@@ -79,7 +80,7 @@ static const Coord ROSETTE_CELLS[5] = {{0,0},{0,6},{1,3},{2,0},{2,6}};
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-enum GameState { GS_MODE_SELECT, GS_ROLL, GS_SELECT_PIECE, GS_AI_MOVE, GS_GAME_OVER };
+enum GameState { GS_MODE_SELECT, GS_RESUME_PROMPT, GS_ROLL, GS_SELECT_PIECE, GS_AI_MOVE, GS_GAME_OVER };
 enum GameMode  { GM_PVP, GM_PvAI };
 
 struct Player {
@@ -95,6 +96,7 @@ struct Player {
 // ---------------------------------------------------------------------------
 TFT_eSPI    tft    = TFT_eSPI();
 TFT_eSprite sprite = TFT_eSprite(&tft);
+Preferences prefs;                       // NVS flash storage for save/load
 
 GameState gState;
 GameMode  gMode;
@@ -113,6 +115,13 @@ int       menuSel;   // 0 = PvP, 1 = PvAI
 bool          aiPending  = false;
 unsigned long aiTimer    = 0;
 static const unsigned int AI_DELAY_MS = 1400;
+
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+void saveGame();
+void clearSave();
+void drawGameOver();
 
 // ============================================================================
 //  GAME LOGIC
@@ -177,9 +186,16 @@ void doMove(int p, int idx) {
     players[p].pos[idx] = dest;
     if (dest == PATH_LEN) players[p].finished++;
     extraTurn = (dest < PATH_LEN && isRosette(dest));
+    saveGame();   // persist state immediately after each move
 }
 
 bool checkWin(int p) { return players[p].finished == NUM_PIECES; }
+
+void onGameOver() {
+    clearSave();          // finished game — no resume needed
+    gState = GS_GAME_OVER;
+    drawGameOver();
+}
 
 int chooseAI(int p) {
     int best = legalMoves[0], bestScore = -9999, opp = 1 - p;
@@ -197,6 +213,63 @@ int chooseAI(int p) {
     return best;
 }
 
+// ============================================================================
+//  SAVE / LOAD  (ESP32 NVS flash — survives power loss)
+// ============================================================================
+
+void saveGame() {
+    prefs.begin("ur_save", false);          // open RW namespace
+    prefs.putBool ("valid",     true);
+    prefs.putInt  ("gMode",     (int)gMode);
+    prefs.putInt  ("curPlayer", curPlayer);
+    prefs.putBool ("extraTurn", extraTurn);
+    prefs.putBool ("p0ai",      players[0].isAI);
+    prefs.putBool ("p1ai",      players[1].isAI);
+    prefs.putInt  ("p0fin",     players[0].finished);
+    prefs.putInt  ("p1fin",     players[1].finished);
+    for (int i = 0; i < NUM_PIECES; i++) {
+        char k[12];
+        snprintf(k, sizeof(k), "p0p%d", i);  prefs.putInt(k, players[0].pos[i]);
+        snprintf(k, sizeof(k), "p1p%d", i);  prefs.putInt(k, players[1].pos[i]);
+    }
+    prefs.end();
+}
+
+void clearSave() {
+    prefs.begin("ur_save", false);
+    prefs.clear();
+    prefs.end();
+}
+
+bool hasSavedGame() {
+    prefs.begin("ur_save", true);           // open read-only
+    bool v = prefs.getBool("valid", false);
+    prefs.end();
+    return v;
+}
+
+void loadGame() {
+    prefs.begin("ur_save", true);
+    gMode      = (GameMode)prefs.getInt("gMode", 0);
+    curPlayer  =           prefs.getInt("curPlayer", 0);
+    extraTurn  =           prefs.getBool("extraTurn", false);
+    players[0].name  = "P1"; players[0].color = TFT_BLUE;
+    players[1].name  = "P2"; players[1].color = TFT_RED;
+    players[0].isAI  = prefs.getBool("p0ai", false);
+    players[1].isAI  = prefs.getBool("p1ai", gMode == GM_PvAI);
+    players[0].finished = prefs.getInt("p0fin", 0);
+    players[1].finished = prefs.getInt("p1fin", 0);
+    for (int i = 0; i < NUM_PIECES; i++) {
+        char k[12];
+        snprintf(k, sizeof(k), "p0p%d", i);  players[0].pos[i] = prefs.getInt(k, -1);
+        snprintf(k, sizeof(k), "p1p%d", i);  players[1].pos[i] = prefs.getInt(k, -1);
+    }
+    prefs.end();
+    // Resume at the roll phase for the saved current player
+    diceRolled = false; curRoll = 0; navIdx = 0; numLegal = 0; aiPending = false;
+    gState = players[curPlayer].isAI ? GS_AI_MOVE : GS_ROLL;
+}
+
 void initGame() {
     for (int p = 0; p < 2; p++) {
         players[p].finished = 0;
@@ -208,12 +281,14 @@ void initGame() {
     curRoll = 0; diceRolled = false;
     navIdx = 0; numLegal = 0; aiPending = false;
     gState = GS_ROLL;
+    clearSave();   // wipe any previous save when starting fresh
 }
 
 void endTurn() {
     if (!extraTurn) curPlayer = 1 - curPlayer;
     extraTurn = false; navIdx = 0; diceRolled = false;
     gState = players[curPlayer].isAI ? GS_AI_MOVE : GS_ROLL;
+    saveGame();   // persist updated curPlayer / extraTurn
 }
 
 // ============================================================================
@@ -385,6 +460,45 @@ void redraw() {
     sprite.pushSprite(0, 0);
 }
 
+// ── Resume-prompt screen ──────────────────────────────────────────────────────
+void drawResumePrompt() {
+    sprite.fillSprite(TFT_BLACK);
+
+    sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
+    sprite.setTextSize(2);
+    sprite.setCursor(46, 10);
+    sprite.print("SAVED GAME FOUND");
+
+    sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    sprite.setTextSize(1);
+    sprite.setCursor(62, 44);
+    sprite.print("Would you like to resume?");
+
+    // YES button
+    sprite.fillRect(24,  66, 124, 40, 0x0340);
+    sprite.drawRect(24,  66, 124, 40, TFT_GREEN);
+    sprite.setTextColor(TFT_WHITE, 0x0340);
+    sprite.setTextSize(2);
+    sprite.setCursor(54, 78);
+    sprite.print("YES");
+    sprite.fillTriangle(26, 86, 26, 96, 35, 91, TFT_GREEN);  // arrow
+
+    // NO button
+    sprite.fillRect(172, 66, 124, 40, 0x2104);
+    sprite.drawRect(172, 66, 124, 40, TFT_DARKGREY);
+    sprite.setTextColor(TFT_LIGHTGREY, 0x2104);
+    sprite.setTextSize(2);
+    sprite.setCursor(212, 78);
+    sprite.print("NO");
+
+    sprite.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    sprite.setTextSize(1);
+    sprite.setCursor(50, 148);
+    sprite.print("NAV: new game    ACT: resume");
+
+    sprite.pushSprite(0, 0);
+}
+
 // ── Mode-select screen ────────────────────────────────────────────────────────
 void drawModeSelect() {
     sprite.fillSprite(TFT_BLACK);
@@ -472,7 +586,7 @@ void completeAITurn() {
         doMove(curPlayer, idx);
         redraw();
         delay(900);
-        if (checkWin(curPlayer)) { gState = GS_GAME_OVER; drawGameOver(); return; }
+        if (checkWin(curPlayer)) { onGameOver(); return; }
         endTurn();
     }
     if (gState == GS_ROLL)    redraw();
@@ -510,8 +624,13 @@ void setup() {
     randomSeed(esp_random());
 
     menuSel = 0;
-    gState  = GS_MODE_SELECT;
-    drawModeSelect();
+    if (hasSavedGame()) {
+        gState = GS_RESUME_PROMPT;
+        drawResumePrompt();
+    } else {
+        gState = GS_MODE_SELECT;
+        drawModeSelect();
+    }
 }
 
 void loop() {
@@ -525,6 +644,12 @@ void loop() {
     if (!nav && !act) return;
 
     switch (gState) {
+
+        case GS_RESUME_PROMPT:
+            // ACT = resume saved game,  NAV = discard save and go to mode select
+            if (act) { loadGame(); redraw(); }
+            if (nav) { clearSave(); gState = GS_MODE_SELECT; drawModeSelect(); }
+            break;
 
         case GS_MODE_SELECT:
             if (nav) { menuSel = 1 - menuSel; drawModeSelect(); }
@@ -557,7 +682,7 @@ void loop() {
                 doMove(curPlayer, legalMoves[navIdx]);
                 redraw();
                 delay(350);
-                if (checkWin(curPlayer)) { gState = GS_GAME_OVER; drawGameOver(); break; }
+                if (checkWin(curPlayer)) { onGameOver(); break; }
                 endTurn();
                 if (gState == GS_ROLL)    redraw();
                 if (gState == GS_AI_MOVE) startAITurn();
