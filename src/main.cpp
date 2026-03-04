@@ -24,6 +24,7 @@
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include "brightness.h"
 
 // ---------------------------------------------------------------------------
 // Hardware
@@ -497,11 +498,14 @@ void setup() {
     Serial.begin(115200);
     pinMode(PIN_BUTTON_NAV, INPUT_PULLUP);
     pinMode(PIN_BUTTON_ACT, INPUT_PULLUP);
+    pinMode(PIN_LCD_BL, OUTPUT);     // Required for brightness control
 
     tft.init();
     tft.setRotation(3);             // landscape: 320 × 170
     sprite.createSprite(320, 170);  // full-screen double buffer
     tft.fillScreen(TFT_BLACK);
+
+    setBrightness(8);               // 50% brightness (0-16) — reduces heat & battery drain
 
     randomSeed(esp_random());
 
