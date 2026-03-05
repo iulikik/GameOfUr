@@ -116,12 +116,21 @@ bool          aiPending  = false;
 unsigned long aiTimer    = 0;
 static const unsigned int AI_DELAY_MS = 1400;
 
+// Per-player dice statistics (reset each new game)
+int rollCounts[2][5];  // rollCounts[player][value 0-4]
+int totalPoints[2];    // sum of all roll values per player
+
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
 void saveGame();
 void clearSave();
 void drawGameOver();
+void drawStatus();
+void drawPiece(int row, int col, uint16_t color, bool selected);
+void drawTurnLine();
+void drawNavIndicator();
+void drawActLabel();
 
 // ============================================================================
 //  GAME LOGIC
@@ -134,6 +143,13 @@ int rollDice() {
     int total = 0;
     for (int i = 0; i < 4; i++) { diceVals[i] = random(0, 2); total += diceVals[i]; }
     return total;
+}
+
+// Record one roll result into per-player statistics
+void recordRoll(int player, int roll) {
+    int r = (roll < 0) ? 0 : (roll > 4) ? 4 : roll;
+    rollCounts[player][r]++;
+    totalPoints[player] += r;
 }
 
 // Destination path-position for player p, piece idx, roll r.  -1 = illegal.
@@ -280,6 +296,11 @@ void initGame() {
     curPlayer = 0; extraTurn = false;
     curRoll = 0; diceRolled = false;
     navIdx = 0; numLegal = 0; aiPending = false;
+    // Reset per-game statistics
+    for (int p = 0; p < 2; p++) {
+        totalPoints[p] = 0;
+        for (int r = 0; r < 5; r++) rollCounts[p][r] = 0;
+    }
     gState = GS_ROLL;
     clearSave();   // wipe any previous save when starting fresh
 }
@@ -321,19 +342,57 @@ void drawBoard() {
 
 // ── 4 tetrahedral dice as triangles on the right edge ────────────────────────
 //    Green filled = marked face (scores 1).  White outline = blank face.
-//    No text — shape alone conveys the result.
-void drawDice() {
+//    flipped=true  → triangles point downward  (used for P2 / AI, 180° rotation)
+//    flipped=false → triangles point upward    (used for P1 / human)
+void drawDice(bool flipped) {
     const int baseX = 311, baseY = BY + 4, edge = 17, h = 15, gap = 6;
     for (int i = 0; i < 4; i++) {
-        int x1 = baseX,           y1 = baseY + i*(h+gap);
-        int x2 = baseX - edge/2,  y2 = y1 + h;
-        int x3 = baseX + edge/2,  y3 = y1 + h;
+        int ty = baseY + i * (h + gap);
+        // Normal (apex up): tip=(baseX,ty)  base-left=(baseX-e/2,ty+h)  base-right=(baseX+e/2,ty+h)
+        // Flipped (apex dn): tip=(baseX,ty+h) base-left=(baseX-e/2,ty)  base-right=(baseX+e/2,ty)
+        int x1 = baseX,           y1 = flipped ? ty + h : ty;
+        int x2 = baseX - edge/2,  y2 = flipped ? ty     : ty + h;
+        int x3 = baseX + edge/2,  y3 = flipped ? ty     : ty + h;
         if (diceVals[i])
             sprite.fillTriangle(x1,y1, x2,y2, x3,y3, TFT_GREEN);
         sprite.drawLine(x1,y1, x2,y2, TFT_WHITE);
         sprite.drawLine(x2,y2, x3,y3, TFT_WHITE);
         sprite.drawLine(x3,y3, x1,y1, TFT_WHITE);
     }
+}
+
+// ── 1-second dice rolling animation ──────────────────────────────────────────
+//    Saves the real roll, flickers random values for ~950 ms, then restores.
+//    Does its own full-board repaint each frame so the board stays visible.
+void animateRoll() {
+    int realVals[4];
+    memcpy(realVals, diceVals, sizeof(diceVals));
+    bool flipped = (curPlayer == 1);
+
+    unsigned long start = millis();
+    while (millis() - start < 950) {
+        for (int i = 0; i < 4; i++) diceVals[i] = random(0, 2);
+
+        sprite.fillSprite(TFT_BLACK);
+        drawBoard();
+        drawStatus();
+        for (int p = 0; p < 2; p++) {
+            for (int i = 0; i < NUM_PIECES; i++) {
+                int pos = players[p].pos[i];
+                if (pos < 0 || pos >= PATH_LEN) continue;
+                const Coord& c = pathCoord(p, pos);
+                drawPiece(c.row, c.col, players[p].color, false);
+            }
+        }
+        drawDice(flipped);
+        drawTurnLine();
+        drawNavIndicator();
+        drawActLabel();
+        sprite.pushSprite(0, 0);
+        delay(80);
+    }
+
+    memcpy(diceVals, realVals, sizeof(diceVals));  // restore real result
 }
 
 // ── One piece: outer filled circle, yellow inner ring when selected ───────────
@@ -450,7 +509,7 @@ void redraw() {
         }
     }
 
-    if (diceRolled) drawDice();
+    if (diceRolled) drawDice(curPlayer == 1);
 
     // Overlay UI elements — no text on the board area
     drawTurnLine();
@@ -508,7 +567,7 @@ void drawModeSelect() {
     sprite.setCursor(18, 6);
     sprite.print("ROYAL  GAME  OF  UR");
 
-    const char* labels[2] = {"  Player vs Player", "  Player vs AI"};
+    const char* labels[2] = {"  Player vs AI", "  Player vs Player"};
     for (int i = 0; i < 2; i++) {
         bool     sel = (menuSel == i);
         uint16_t bg  = sel ? 0x0340 : 0x2104;     // dark green : dark grey
@@ -536,28 +595,92 @@ void drawModeSelect() {
 void drawGameOver() {
     sprite.fillSprite(TFT_BLACK);
 
-    sprite.fillRect(0, 0, 320, 38, players[curPlayer].color);
+    // ── Winner banner ────────────────────────────────────────────────────────
+    sprite.fillRect(0, 0, 320, 22, players[curPlayer].color);
     sprite.setTextColor(TFT_WHITE, players[curPlayer].color);
     sprite.setTextSize(2);
-    sprite.setCursor(80, 10);
+    sprite.setCursor(66, 3);
     sprite.print("*  WINNER!  *");
 
+    // Winner name (centred, player colour)
     sprite.setTextColor(players[curPlayer].color, TFT_BLACK);
-    sprite.setTextSize(3);
-    sprite.setCursor(110, 55);
+    sprite.setTextSize(2);
+    sprite.setCursor(130, 24);
     sprite.print(players[curPlayer].name);
 
+    // ── Statistics heading ───────────────────────────────────────────────────
+    sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
+    sprite.setTextSize(1);
+    sprite.setCursor(72, 44);
+    sprite.print("── DICE ROLL STATISTICS ──");
+
+    // Column headers  (P1 in blue, P2 in red)
+    sprite.setTextColor(TFT_BLUE, TFT_BLACK);
+    sprite.setCursor(192, 54);
+    sprite.print("P1");
+    sprite.setTextColor(TFT_RED, TFT_BLACK);
+    sprite.setCursor(256, 54);
+    sprite.print("P2");
+
+    // ── Per-roll-value rows ──────────────────────────────────────────────────
+    static const char* rowLabel[5] = {
+        "Rolled  0 :", "Rolled  1 :", "Rolled  2 :", "Rolled  3 :", "Rolled  4 :"
+    };
+    char buf[8];
+    for (int r = 0; r < 5; r++) {
+        int y = 64 + r * 11;
+        sprite.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        sprite.setCursor(20, y);
+        sprite.print(rowLabel[r]);
+
+        snprintf(buf, sizeof(buf), "%3d", rollCounts[0][r]);
+        sprite.setTextColor(TFT_CYAN, TFT_BLACK);
+        sprite.setCursor(192, y);
+        sprite.print(buf);
+
+        snprintf(buf, sizeof(buf), "%3d", rollCounts[1][r]);
+        sprite.setTextColor(TFT_PINK, TFT_BLACK);
+        sprite.setCursor(256, y);
+        sprite.print(buf);
+    }
+
+    // ── Divider ──────────────────────────────────────────────────────────────
+    sprite.drawLine(16, 121, 304, 121, TFT_DARKGREY);
+
+    // ── Totals ───────────────────────────────────────────────────────────────
     sprite.setTextColor(TFT_WHITE, TFT_BLACK);
-    sprite.setTextSize(2);
-    char buf[28];
-    snprintf(buf, sizeof(buf), "P1: %d/7    P2: %d/7",
-             players[0].finished, players[1].finished);
-    sprite.setCursor(22, 110);
+    sprite.setCursor(20, 124);
+    sprite.print("Total pts  :");
+
+    snprintf(buf, sizeof(buf), "%3d", totalPoints[0]);
+    sprite.setTextColor(TFT_CYAN, TFT_BLACK);
+    sprite.setCursor(192, 124);
     sprite.print(buf);
 
+    snprintf(buf, sizeof(buf), "%3d", totalPoints[1]);
+    sprite.setTextColor(TFT_PINK, TFT_BLACK);
+    sprite.setCursor(256, 124);
+    sprite.print(buf);
+
+    // Pieces finished row
+    sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    sprite.setCursor(20, 135);
+    sprite.print("Fin pieces :");
+
+    snprintf(buf, sizeof(buf), "%3d", players[0].finished);
+    sprite.setTextColor(TFT_CYAN, TFT_BLACK);
+    sprite.setCursor(192, 135);
+    sprite.print(buf);
+
+    snprintf(buf, sizeof(buf), "%3d", players[1].finished);
+    sprite.setTextColor(TFT_PINK, TFT_BLACK);
+    sprite.setCursor(256, 135);
+    sprite.print(buf);
+
+    // ── Footer ───────────────────────────────────────────────────────────────
     sprite.setTextColor(TFT_DARKGREY, TFT_BLACK);
     sprite.setTextSize(1);
-    sprite.setCursor(82, 152);
+    sprite.setCursor(82, 155);
     sprite.print("ACT: play again");
 
     sprite.pushSprite(0, 0);
@@ -568,7 +691,9 @@ void drawGameOver() {
 // ============================================================================
 void startAITurn() {
     curRoll    = rollDice();
+    recordRoll(curPlayer, curRoll);
     diceRolled = true;
+    animateRoll();
     computeLegal(curPlayer, curRoll);
     redraw();
     aiPending = true;
@@ -653,13 +778,15 @@ void loop() {
 
         case GS_MODE_SELECT:
             if (nav) { menuSel = 1 - menuSel; drawModeSelect(); }
-            if (act) { gMode = (menuSel == 0) ? GM_PVP : GM_PvAI; initGame(); redraw(); }
+            if (act) { gMode = (menuSel == 0) ? GM_PvAI : GM_PVP; initGame(); redraw(); }
             break;
 
         case GS_ROLL:
             if (act) {
                 curRoll    = rollDice();
+                recordRoll(curPlayer, curRoll);
                 diceRolled = true;
+                animateRoll();
                 computeLegal(curPlayer, curRoll);
                 navIdx = 0;
                 gState = GS_SELECT_PIECE;
